@@ -25,7 +25,10 @@ class Settings(
         const val KEY_MODEL = "model"
         const val KEY_PLAYER_PORT = "player_port"
 
-        const val DEFAULT_MODEL = "Chromecast"
+        // A TV-style screen, not a Cast dongle: YouTube's phone app treats a
+        // screen that calls itself a Chromecast as one backed by a Cast
+        // session, and drops the session when it finds none.
+        const val DEFAULT_MODEL = "Echo Show 8"
         const val DEFAULT_PLAYER_PORT = 8010
     }
 }

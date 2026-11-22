@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod dial;
 mod lounge;
 mod resolver;
 mod sponsorblock;
@@ -35,6 +36,111 @@ impl YouTube {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// Standalone, certificate-free YouTube pairing that bypasses the Cast MDX
+/// bootstrap entirely. Pairs a Lounge screen over plain HTTPS, invokes
+/// `on_code` with the manual code to display (entered in the phone's YouTube
+/// app under Settings → "Link with TV code", NOT youtube.com/activate, which is
+/// account sign-in and rejects this code), then logs every Lounge command until `cancel`
+/// fires. This proves the cert-free control path end to end without a Cast
+/// session, device-auth certificate, or mDNS.
+///
+/// Media is deliberately not resolved or played here — this is the control
+/// plane only. The existing `resolve`/`PlaybackController` wiring handles
+/// playback once the command stream is confirmed.
+pub async fn run_pairing_demo(
+    http: reqwest::Client,
+    data_dir: std::path::PathBuf,
+    device_model: impl Into<String>,
+    on_code: impl FnOnce(&str),
+    cancel: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let receiver = vibecast_sdk::ReceiverContext::new(
+        "vibecast",
+        device_model,
+        "vibecast-pair-demo",
+        data_dir,
+    );
+    let lounge = LoungeConnection::establish(http.clone(), &receiver)
+        .await
+        .map_err(|error| format!("Lounge pairing failed: {error}"))?;
+    let code = lounge
+        .get_pairing_code()
+        .await
+        .map_err(|error| format!("pairing code request failed: {error}"))?;
+    on_code(&code);
+
+    let (command_tx, mut command_rx) = mpsc::channel::<LoungeCommand>(32);
+    let (_playback_tx, playback_rx) = mpsc::channel::<PlaybackState>(32);
+    let (identity_tx, _identity) = watch::channel(None);
+
+    // Resolve each queued video to a playable stream, on the host, with no
+    // renderer. Capabilities default to the Echo's profile: H.264/HEVC + AAC,
+    // 1080p, no HDR. This confirms YouTube hands back a real media URL before
+    // any device/render work.
+    let resolver = Resolver::new(http);
+    let capabilities = vibecast_sdk::PlayerCapabilities::default();
+    tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            tracing::info!(?command, "Lounge command received");
+            let LoungeCommand::SetPlaylist {
+                video_ids,
+                current_index,
+                current_time,
+                ..
+            } = &command
+            else {
+                continue;
+            };
+            let Some(video_id) = video_ids.get(*current_index).cloned() else {
+                continue;
+            };
+            tracing::info!(%video_id, start_time = *current_time, "resolving stream...");
+            match resolver
+                .resolve(
+                    &video_id,
+                    *current_time,
+                    &capabilities,
+                    PreferredVideoCodec::Auto,
+                )
+                .await
+            {
+                Ok(media) => {
+                    let first_media_url = media
+                        .streams
+                        .first()
+                        .and_then(|stream| match &stream.source {
+                            vibecast_sdk::StreamSource::InlineManifest(mpd) => first_base_url(mpd),
+                            vibecast_sdk::StreamSource::Url(url) => Some(url.clone()),
+                        })
+                        .unwrap_or_else(|| "(none)".to_string());
+                    tracing::info!(
+                        title = media.title.as_deref().unwrap_or("?"),
+                        author = media.subtitle.as_deref().unwrap_or("?"),
+                        duration = media.duration.unwrap_or_default(),
+                        streams = media.streams.len(),
+                        first_media_url = %first_media_url,
+                        "resolved playable stream"
+                    );
+                }
+                Err(error) => tracing::warn!(%video_id, %error, "resolve failed"),
+            }
+        }
+    });
+    lounge
+        .run(command_tx, playback_rx, identity_tx, cancel)
+        .await;
+    Ok(())
+}
+
+/// Extract the first `<BaseURL>` from a DASH manifest, to surface a concrete
+/// media URL (XML-escaped as it appears in the manifest) in the demo log.
+fn first_base_url(mpd: &str) -> Option<String> {
+    let start = mpd.find("<BaseURL>")? + "<BaseURL>".len();
+    let rest = &mpd[start..];
+    let end = rest.find("</BaseURL>")?;
+    Some(rest[..end].to_string())
 }
 
 #[async_trait]
@@ -275,6 +381,19 @@ async fn run_lounge(
             }
         }
     };
+
+    // Local discovery, so the phone keeps this screen as a cast target while
+    // the user browses instead of ending the session at the first tap.
+    tokio::spawn(dial::serve(
+        Arc::new(dial::Screen {
+            friendly_name: lounge::SCREEN_NAME.to_owned(),
+            model: receiver.device_model.clone(),
+            uuid: receiver.device_id.clone(),
+            registrar: lounge.registrar(lounge::SCREEN_NAME),
+            launched: std::sync::atomic::AtomicBool::new(false),
+        }),
+        cancel.clone(),
+    ));
 
     lounge
         .run(command_tx, playback_rx, identity_tx, cancel)

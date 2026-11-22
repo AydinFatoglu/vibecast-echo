@@ -1,5 +1,6 @@
 import io.gitlab.arturbosch.detekt.Detekt
 import org.gradle.api.tasks.Exec
+import org.jlleitschuh.gradle.ktlint.tasks.BaseKtLintCheckTask
 
 plugins {
     alias(libs.plugins.android.application)
@@ -16,7 +17,17 @@ val workspaceDir: File = rootProject.projectDir.parentFile
 val cargoBinDir = File(System.getProperty("user.home"), ".cargo/bin")
 val cargo: String = File(cargoBinDir, "cargo").absolutePath
 val androidApiLevel = 24
-val rustAbis = listOf("arm64-v8a", "x86_64")
+
+// ABIs the Rust core is cross-compiled for. Overridable so a build can be
+// narrowed to a single device family — e.g. the ARM32-only Amazon Echo Show 8
+// Gen1 (Android 7.1.2 / API 25), which has no 64-bit app support:
+//   ./gradlew :app:assembleDebug -Pvibecast.abis=armeabi-v7a
+val defaultRustAbis = "arm64-v8a,armeabi-v7a,x86_64"
+val rustAbis: List<String> =
+    (providers.gradleProperty("vibecast.abis").orNull ?: defaultRustAbis)
+        .split(',')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
 
 // Single source of truth for the app version; release-please bumps the literal
 // below on release (see release-please-config.json extra-files).
@@ -137,6 +148,9 @@ val generateUniffiKotlin =
         }
     }
 
+// The shipped file is named after the product, not after the Gradle module.
+base.archivesName.set("Show8Cast")
+
 android {
     namespace = "com.vibecast.receiver"
     compileSdk = 37
@@ -144,7 +158,10 @@ android {
 
     defaultConfig {
         applicationId = "com.vibecast.receiver"
-        minSdk = 26
+        // API 25 (Android 7.1.2) is the floor: the Amazon Echo Show 8 Gen1 ships
+        // 7.1.2 / armeabi-v7a. API 26+ calls are routed through AndroidX compat
+        // (see CastReceiverService) rather than version-guarded by hand.
+        minSdk = 25
         targetSdk = 37
         versionCode = versionCodeFrom(appVersionName)
         versionName = appVersionName
@@ -218,13 +235,36 @@ android {
 // Native libs (jniLibs) + generated bindings must exist before compile/merge.
 tasks.named("preBuild") { dependsOn(cargoBuildAndroid, generateUniffiKotlin) }
 
+val validatePlaySigning =
+    tasks.register("validatePlaySigning") {
+        group = "verification"
+        description = "Require release signing and 64-bit support before building a Play bundle"
+        doLast {
+            val missing =
+                listOf(
+                    "ANDROID_KEYSTORE_FILE",
+                    "ANDROID_KEYSTORE_PASSWORD",
+                    "ANDROID_KEY_ALIAS",
+                    "ANDROID_KEY_PASSWORD",
+                ).filter { System.getenv(it).isNullOrBlank() }
+            if (missing.isNotEmpty()) {
+                throw GradleException("Play signing variables missing: ${missing.joinToString()}")
+            }
+            if ("armeabi-v7a" in rustAbis && "arm64-v8a" !in rustAbis) {
+                throw GradleException("Google Play bundles with armeabi-v7a also need arm64-v8a")
+            }
+        }
+    }
+tasks.matching { it.name == "bundleRelease" }.configureEach { dependsOn(validatePlaySigning) }
+
 ktlint {
     version.set("1.3.1")
     android.set(true)
-    // Never lint the generated UniFFI bindings.
-    filter {
-        exclude { element -> element.file.path.contains("generated/uniffi") }
-    }
+}
+
+// Apply the exclusion directly to the tasks, including AGP's generated source roots.
+tasks.withType<BaseKtLintCheckTask>().configureEach {
+    exclude { element -> element.file.toPath().startsWith(uniffiGenDir.get().asFile.toPath()) }
 }
 
 detekt {
@@ -246,4 +286,13 @@ dependencies {
     // JNA (@aar bundles the native dispatch libs per ABI) — required by the
     // UniFFI-generated Kotlin bindings.
     implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
+    // The on-device player. DASH and HLS are separate artifacts; both are
+    // needed because the receiver's apps hand out either kind of manifest.
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.exoplayer.dash)
+    implementation(libs.media3.exoplayer.hls)
+    implementation(libs.media3.ui)
+    // Talks the bridge's player protocol over a WebSocket, in place of the
+    // browser page that used to do it.
+    implementation(libs.okhttp)
 }

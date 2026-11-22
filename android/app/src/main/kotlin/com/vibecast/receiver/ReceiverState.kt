@@ -10,6 +10,9 @@ import android.os.Looper
  * updates are marshalled to the main thread before notifying the listener.
  */
 object ReceiverState {
+    /** The [status] value meaning the player bridge is listening. */
+    const val RUNNING = "Running"
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile

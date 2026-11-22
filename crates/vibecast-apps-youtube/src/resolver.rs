@@ -453,10 +453,13 @@ fn playback_media(
 
     Ok(PlaybackMedia {
         session_id: String::new(),
-        streams: vec![PlaybackStream::inline_manifest(
-            manifest,
-            "application/dash+xml",
-        )],
+        // The media URLs in this manifest were issued to the client identity
+        // below; googlevideo answers 403 when the segment requests arrive under
+        // a different one, so the player must fetch them as that same client.
+        streams: vec![
+            PlaybackStream::inline_manifest(manifest, "application/dash+xml")
+                .with_request_header("User-Agent", CLIENT_USER_AGENT),
+        ],
         stream_type: StreamType::Buffered,
         content_id: details
             .as_ref()
@@ -942,6 +945,9 @@ fn xml_escape_attr(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// The video `AdaptationSet`'s id; audio and text sets are numbered after it.
+const VIDEO_ADAPTATION_ID: usize = 0;
+
 fn render_mpd(
     video_reps: &[&VideoRep],
     audio_groups: &[AudioGroup<'_>],
@@ -964,7 +970,11 @@ minBufferTime=\"PT1.5S\" mediaPresentationDuration=\"PT{:.3}S\">",
 
     let _ = writeln!(
         out,
-        "<AdaptationSet id=\"video\" contentType=\"video\" mimeType=\"{}\" \
+        // `AdaptationSet@id` is xs:unsignedInt in DASH, and strict parsers —
+        // ExoPlayer among them — reject anything else outright, so these ids
+        // are numbered rather than named. `Representation@id` below is a
+        // string in the schema and stays descriptive.
+        "<AdaptationSet id=\"{VIDEO_ADAPTATION_ID}\" contentType=\"video\" mimeType=\"{}\" \
 subsegmentAlignment=\"true\" startWithSAP=\"1\">",
         video_reps[0].container
     );
@@ -1014,7 +1024,8 @@ subsegmentAlignment=\"true\" startWithSAP=\"1\">",
         let first = group.reps[0];
         let _ = writeln!(
             out,
-            "<AdaptationSet id=\"audio-{index}\" contentType=\"audio\" mimeType=\"{}\" lang=\"{}\" startWithSAP=\"1\">",
+            "<AdaptationSet id=\"{}\" contentType=\"audio\" mimeType=\"{}\" lang=\"{}\" startWithSAP=\"1\">",
+            VIDEO_ADAPTATION_ID + 1 + index,
             first.container,
             xml_escape_attr(&group.language),
         );
@@ -1084,7 +1095,8 @@ schemeIdUri=\"urn:mpeg:dash:23003:3:audio_channel_configuration:2011\" value=\"{
         };
         let _ = writeln!(
             out,
-            "<AdaptationSet id=\"text-{index}\" contentType=\"text\" mimeType=\"text/vtt\" lang=\"{}\">",
+            "<AdaptationSet id=\"{}\" contentType=\"text\" mimeType=\"text/vtt\" lang=\"{}\">",
+            VIDEO_ADAPTATION_ID + 1 + audio_groups.len() + index,
             xml_escape_attr(&language),
         );
         let _ = writeln!(

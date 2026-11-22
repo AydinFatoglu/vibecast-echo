@@ -12,12 +12,14 @@ use tokio_util::codec::Framed;
 
 use vibecast_cast::{message, namespace as ns, run_connection, AuthMaterial, ServerEvent};
 use vibecast_messages::{PlayerState, Volume};
-use vibecast_player_api::{LicenseHandler, ManifestHandler, Player, PlayerCommand, PlayerReport};
+use vibecast_player_api::{
+    LicenseHandler, ManifestHandler, MediaUpstream, Player, PlayerCommand, PlayerReport,
+};
 use vibecast_proto::CastCodec;
 use vibecast_sdk::{
     AppContext, AppManifest, AppProvider, AppSession, AppSettingsSchema, LaunchCredentials,
-    LaunchError, LoadRequest, MediaResolveError, PlaybackMedia, PlaybackStream, PlayerCapabilities,
-    ReceiverContext, SettingDescriptor, SettingKey, SettingScope, StreamType,
+    LaunchError, LoadRequest, MediaResolveError, PairingObserver, PlaybackMedia, PlaybackStream,
+    PlayerCapabilities, ReceiverContext, SettingDescriptor, SettingKey, SettingScope, StreamType,
 };
 use vibecast_security::CertificateBundle;
 use vibecast_settings::{
@@ -77,6 +79,19 @@ impl ProxyRegistrar for FakeProxy {
             .lock()
             .unwrap()
             .push(format!("-manifest:{session_id}"));
+    }
+    fn register_media(&self, session_id: &str, streams: Vec<MediaUpstream>) -> String {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("+media:{session_id}:{}", streams.len()));
+        format!("http://proxy/media/{session_id}")
+    }
+    fn unregister_media(&self, session_id: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("-media:{session_id}"));
     }
 }
 
@@ -284,6 +299,7 @@ async fn setup_with_player_settings(player_settings: PlayerSettings) -> Harness 
         cast_device_capabilities: String::new(),
         capabilities: PlayerCapabilities::default(),
         player_settings,
+        pairing: None,
     });
     let hub_handle = hub.handle();
     {
@@ -305,6 +321,119 @@ async fn setup_with_player_settings(player_settings: PlayerSettings) -> Harness 
         proxy,
         launched_setting,
     }
+}
+
+// -- cert-free launch ------------------------------------------------------
+
+#[derive(Default)]
+struct RecordingPairing {
+    codes: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl PairingObserver for RecordingPairing {
+    async fn pairing_code(&self, code: &str) {
+        self.codes.lock().unwrap().push(code.to_string());
+    }
+}
+
+/// An app that reports a code through whatever observer the hub gave it, and
+/// then records whether it saw one — so a test reads the flag knowing the code
+/// (if any) is already in the recorder.
+struct PairingApp {
+    observer_present: Arc<Mutex<Option<bool>>>,
+}
+
+#[async_trait]
+impl AppProvider for PairingApp {
+    fn manifest(&self) -> AppManifest {
+        fake_manifest()
+    }
+
+    async fn launch(
+        &self,
+        ctx: &AppContext,
+        _credentials: LaunchCredentials,
+    ) -> Result<Arc<dyn AppSession>, LaunchError> {
+        let observer = ctx.pairing_observer();
+        if let Some(pairing) = &observer {
+            pairing.pairing_code(PAIRING_CODE).await;
+        }
+        *self.observer_present.lock().unwrap() = Some(observer.is_some());
+        Ok(Arc::new(FakeSession))
+    }
+}
+
+const PAIRING_CODE: &str = "123456789012";
+
+async fn certfree_hub(
+    observer_present: Arc<Mutex<Option<bool>>>,
+    pairing: Option<Arc<dyn PairingObserver>>,
+) -> DeviceHubHandle {
+    let catalog = SettingsCatalog::new(vec![fake_manifest().settings]).expect("settings catalog");
+    let service = SettingsService::new(catalog, Arc::new(MemorySettingsPersistence::default()))
+        .await
+        .expect("settings service");
+    let hub = DeviceHub::new(HubConfig {
+        identity: DeviceIdentity::new("Echo".into(), "Chromecast".into(), "dev-1".into()),
+        registry: AppRegistry::new(vec![
+            Arc::new(PairingApp { observer_present }) as Arc<dyn AppProvider>
+        ])
+        .expect("registry"),
+        player: Arc::new(FakePlayer::default()),
+        proxy: Arc::new(FakeProxy::default()),
+        http: reqwest::Client::new(),
+        data_dir: std::env::temp_dir().join("vibecast-core-tests"),
+        volume: attenuation_volume(),
+        user_agent: String::new(),
+        cast_device_capabilities: String::new(),
+        capabilities: PlayerCapabilities::default(),
+        player_settings: service.player("player-1").expect("player settings"),
+        pairing,
+    });
+    let handle = hub.handle();
+    tokio::spawn(hub.run());
+    handle
+}
+
+/// A cert-free launch has no sender to poll, so the test waits for the app to
+/// publish what it saw.
+async fn await_launch(observer_present: &Mutex<Option<bool>>) -> bool {
+    for _ in 0..200 {
+        if let Some(present) = *observer_present.lock().unwrap() {
+            return present;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+    }
+    panic!("cert-free launch never reached the app");
+}
+
+#[tokio::test]
+async fn certfree_launch_hands_the_app_the_pairing_observer() {
+    let observer_present = Arc::new(Mutex::new(None));
+    let recorder = Arc::new(RecordingPairing::default());
+    let hub = certfree_hub(
+        observer_present.clone(),
+        Some(recorder.clone() as Arc<dyn PairingObserver>),
+    )
+    .await;
+
+    hub.launch_app("APP1").await.expect("cert-free launch");
+
+    assert!(await_launch(&observer_present).await);
+    assert_eq!(recorder.codes.lock().unwrap().as_slice(), [PAIRING_CODE]);
+}
+
+#[tokio::test]
+async fn certfree_launch_without_an_observer_leaves_the_app_silent() {
+    let observer_present = Arc::new(Mutex::new(None));
+    let recorder = Arc::new(RecordingPairing::default());
+    let hub = certfree_hub(observer_present.clone(), None).await;
+
+    hub.launch_app("APP1").await.expect("cert-free launch");
+
+    assert!(!await_launch(&observer_present).await);
+    assert!(recorder.codes.lock().unwrap().is_empty());
 }
 
 async fn send(

@@ -33,6 +33,6 @@ pub use protocol::{
 };
 pub use proxy::{
     LicenseHandler, LicenseRequest, LicenseResponse, ManifestHandler, ManifestProxyRequest,
-    ManifestProxyResponse, ProxyError, ProxyRegistrar, ProxyResult, RouteId, RouteIdParseError,
-    RouteKind,
+    ManifestProxyResponse, MediaUpstream, ProxyError, ProxyRegistrar, ProxyResult, RouteId,
+    RouteIdParseError, RouteKind,
 };

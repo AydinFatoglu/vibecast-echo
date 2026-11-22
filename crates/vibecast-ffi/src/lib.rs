@@ -41,8 +41,11 @@ uniffi::setup_scaffolding!();
 pub struct ServerConfig {
     /// Data directory (e.g. `Context.filesDir.absolutePath`).
     pub data_dir: String,
-    /// Certificate manifest path (provisioned into the data dir).
-    pub certs_path: String,
+    /// Certificate manifest path (provisioned into the data dir), or `None`
+    /// (or blank) to run **cert-free**: no CastV2/eureka listener is bound and
+    /// nothing is advertised, so the receiver renders only what
+    /// [`auto_launch_app_id`](Self::auto_launch_app_id) starts for it.
+    pub certs_path: Option<String>,
     /// Device model string (reported by every player's receiver).
     pub model: String,
     /// Host/interface to bind (e.g. `0.0.0.0`).
@@ -54,6 +57,12 @@ pub struct ServerConfig {
     /// from `NetworkInterface` enumeration); `None` falls back to the
     /// routed-interface heuristic.
     pub local_ip: Option<String>,
+    /// Cast app id each player's receiver launches on its own, without a Cast
+    /// sender and without a Cast device certificate (YouTube is `233637DE`).
+    /// The app then pairs its own control channel and reports the code to show
+    /// through [`ReceiverObserver::on_pairing_code`]. `None` (or blank) keeps
+    /// the Cast-driven launch, where a sender decides what runs.
+    pub auto_launch_app_id: Option<String>,
 }
 
 /// A single Cast TXT record entry, mirrored into the frontend's discovery
@@ -66,13 +75,10 @@ pub struct TxtEntry {
     pub value: String,
 }
 
-/// Discovery facts for one newly started per-player receiver.
+/// What a frontend needs to advertise one per-player receiver over its native
+/// discovery API.
 #[derive(uniffi::Record)]
-pub struct PlayerStartedInfo {
-    /// Stable player lifecycle key.
-    pub player_id: String,
-    /// Advertised friendly name.
-    pub name: String,
+pub struct DiscoveryInfo {
     /// DNS-SD service instance name.
     pub instance_name: String,
     /// CastV2 TLS port.
@@ -81,6 +87,19 @@ pub struct PlayerStartedInfo {
     pub eureka_http_port: u16,
     /// Cast TXT record entries.
     pub txt: Vec<TxtEntry>,
+}
+
+/// One newly started per-player receiver.
+#[derive(uniffi::Record)]
+pub struct PlayerStartedInfo {
+    /// Stable player lifecycle key.
+    pub player_id: String,
+    /// Advertised friendly name.
+    pub name: String,
+    /// What to register for discovery, or `None` when this receiver started
+    /// cert-free: nothing Cast-facing was bound, so there is no service to
+    /// advertise. The player is still live — it just renders locally.
+    pub discovery: Option<DiscoveryInfo>,
 }
 
 /// Errors starting the receiver, surfaced as typed exceptions to the frontend.
@@ -141,6 +160,10 @@ pub trait ReceiverObserver: Send + Sync {
     fn on_player_started(&self, started: PlayerStartedInfo) -> Result<(), CallbackError>;
     /// A player disconnected; unregister its receiver from discovery.
     fn on_player_stopped(&self, player_id: String) -> Result<(), CallbackError>;
+    /// An app on this player's receiver produced a manual pairing code; show it
+    /// so the phone app can be linked to this screen. Fires only when
+    /// [`ServerConfig::auto_launch_app_id`] is set (the certificate-free path).
+    fn on_pairing_code(&self, player_id: String, code: String) -> Result<(), CallbackError>;
     /// A non-fatal error occurred after startup.
     fn on_error(&self, message: String) -> Result<(), CallbackError>;
 }
@@ -155,10 +178,12 @@ impl PlayerObserver for ForeignObserver {
         let started = PlayerStartedInfo {
             player_id: started.player_id,
             name: started.name,
-            instance_name: started.instance_name,
-            cast_port: started.cast_port,
-            eureka_http_port: started.eureka_http_port,
-            txt: to_txt_entries(started.txt),
+            discovery: started.discovery.map(|discovery| DiscoveryInfo {
+                instance_name: discovery.instance_name,
+                cast_port: discovery.cast_port,
+                eureka_http_port: discovery.eureka_http_port,
+                txt: to_txt_entries(discovery.txt),
+            }),
         };
         if let Err(error) = self.inner.on_player_started(started) {
             tracing::warn!(%error, "observer.on_player_started failed");
@@ -168,6 +193,15 @@ impl PlayerObserver for ForeignObserver {
     fn on_player_stopped(&self, player_id: &str) {
         if let Err(error) = self.inner.on_player_stopped(player_id.to_string()) {
             tracing::warn!(%error, "observer.on_player_stopped failed");
+        }
+    }
+
+    fn on_pairing_code(&self, player_id: &str, code: &str) {
+        if let Err(error) = self
+            .inner
+            .on_pairing_code(player_id.to_string(), code.to_string())
+        {
+            tracing::warn!(%error, "observer.on_pairing_code failed");
         }
     }
 }
@@ -267,12 +301,20 @@ fn build_config(config: ServerConfig) -> (Config, PlatformInputs) {
 
     let inputs = PlatformInputs {
         data_dir: PathBuf::from(config.data_dir),
-        certs_path: PathBuf::from(config.certs_path),
+        // A blank path means the same as none: run cert-free rather than fail
+        // trying to read a manifest that was never provisioned.
+        certs_path: config
+            .certs_path
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from),
         // Android/iOS advertise each player's receiver via the native discovery
         // API using the per-player facts from `on_player_started` — never via
         // mDNS from Rust.
         advertise_mdns: false,
         local_ip: config.local_ip.filter(|ip| !ip.trim().is_empty()),
+        auto_launch_app_id: config
+            .auto_launch_app_id
+            .filter(|app_id| !app_id.trim().is_empty()),
     };
     (platform_config, inputs)
 }
@@ -352,11 +394,12 @@ mod tests {
     fn base_config() -> ServerConfig {
         ServerConfig {
             data_dir: "/tmp/vibecast-ffi-test".to_owned(),
-            certs_path: "/tmp/vibecast-ffi-test/certs.json".to_owned(),
+            certs_path: Some("/tmp/vibecast-ffi-test/certs.json".to_owned()),
             model: "Chromecast".to_owned(),
             bind_host: "127.0.0.1".to_owned(),
             player_port: 9010,
             local_ip: None,
+            auto_launch_app_id: None,
         }
     }
 
@@ -367,7 +410,39 @@ mod tests {
         assert_eq!(config.network.player_port, 9010);
         assert!(!inputs.advertise_mdns);
         assert_eq!(inputs.local_ip, None);
-        let _ = inputs.certs_path;
+        assert_eq!(
+            inputs.certs_path,
+            Some(PathBuf::from("/tmp/vibecast-ffi-test/certs.json"))
+        );
+    }
+
+    /// A frontend with nothing provisioned passes a missing — or, from a Kotlin
+    /// `File.absolutePath` that was never written, blank — path. Both must
+    /// select the cert-free path rather than fail reading a manifest.
+    #[test]
+    fn absent_or_blank_certs_path_selects_the_cert_free_path() {
+        let mut sc = base_config();
+        sc.certs_path = None;
+        let (_, inputs) = build_config(sc);
+        assert_eq!(inputs.certs_path, None);
+
+        let mut sc = base_config();
+        sc.certs_path = Some("   ".to_owned());
+        let (_, inputs) = build_config(sc);
+        assert_eq!(inputs.certs_path, None);
+    }
+
+    #[test]
+    fn auto_launch_app_id_is_threaded_and_blank_treated_as_absent() {
+        let mut sc = base_config();
+        sc.auto_launch_app_id = Some("233637DE".to_owned());
+        let (_, inputs) = build_config(sc);
+        assert_eq!(inputs.auto_launch_app_id.as_deref(), Some("233637DE"));
+
+        let mut sc = base_config();
+        sc.auto_launch_app_id = Some("  ".to_owned());
+        let (_, inputs) = build_config(sc);
+        assert_eq!(inputs.auto_launch_app_id, None);
     }
 
     #[test]

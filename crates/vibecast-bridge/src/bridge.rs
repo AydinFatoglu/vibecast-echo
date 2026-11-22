@@ -32,9 +32,9 @@ use tokio::task::JoinHandle;
 use vibecast_player_api::headers::{filter_upstream_headers, filter_upstream_response_headers};
 use vibecast_player_api::{
     AppSettingsPayload, ClientMessage, LicenseHandler, LicenseRequest, ManifestHandler,
-    ManifestProxyRequest, Player, PlayerCommand, PlayerRegistration, PlayerReport, ProxyRegistrar,
-    RouteId, ServerMessage, SettingOptionPayload, SettingPayload, SettingsSnapshotMessage,
-    SettingsUpdateResultMessage, SettingsUpdateStatus,
+    ManifestProxyRequest, MediaUpstream, Player, PlayerCommand, PlayerRegistration, PlayerReport,
+    ProxyRegistrar, RouteId, ServerMessage, SettingOptionPayload, SettingPayload,
+    SettingsSnapshotMessage, SettingsUpdateResultMessage, SettingsUpdateStatus,
 };
 use vibecast_settings::{
     AppSettingsReader, AppSettingsSchema, PlayerSettings, SettingDescriptor, SettingMutation,
@@ -103,6 +103,12 @@ struct BridgeState {
     settings: SettingsService,
     licenses: Arc<Mutex<HashMap<String, Arc<dyn LicenseHandler>>>>,
     manifests: Arc<Mutex<HashMap<String, Arc<dyn ManifestHandler>>>>,
+    /// Upstream media URLs this bridge fetches on a player's behalf, per
+    /// session, indexed by their position in the session's stream list.
+    media: Arc<Mutex<HashMap<String, Arc<Vec<MediaUpstream>>>>>,
+    /// Client for those fetches. Deliberately without a request timeout: a
+    /// media response is streamed for as long as playback lasts.
+    http: reqwest::Client,
     resolved_host: Arc<str>,
     configured_port: u16,
     port: Arc<AtomicU16>,
@@ -119,6 +125,14 @@ impl BridgeState {
 
     fn manifest_handler(&self, session_id: &str) -> Option<Arc<dyn ManifestHandler>> {
         self.manifests.lock().unwrap().get(session_id).cloned()
+    }
+
+    fn media_upstream(&self, session_id: &str, index: usize) -> Option<MediaUpstream> {
+        self.media
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|streams| streams.get(index).cloned())
     }
 
     fn serving_port(&self) -> Option<u16> {
@@ -167,6 +181,8 @@ impl PlayerBridge {
             settings,
             licenses: Arc::new(Mutex::new(HashMap::new())),
             manifests: Arc::new(Mutex::new(HashMap::new())),
+            media: Arc::new(Mutex::new(HashMap::new())),
+            http: reqwest::Client::new(),
             resolved_host: Arc::from(resolved_host.as_str()),
             configured_port: port,
             port: Arc::new(AtomicU16::new(0)),
@@ -293,6 +309,31 @@ impl PlayerBridge {
     pub fn unregister_manifest_handler(&self, session_id: &str) {
         self.state.manifests.lock().unwrap().remove(session_id);
     }
+
+    /// Register this session's proxied media URLs; returns their URL prefix.
+    pub fn register_media_routes(
+        &self,
+        session_id: impl Into<String>,
+        streams: Vec<MediaUpstream>,
+    ) -> String {
+        let session_id = session_id.into();
+        self.state
+            .media
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), Arc::new(streams));
+        format!(
+            "http://{}:{}/media/{}",
+            self.state.resolved_host,
+            self.state.effective_port(),
+            session_id
+        )
+    }
+
+    /// Unregister this session's proxied media URLs.
+    pub fn unregister_media_routes(&self, session_id: &str) {
+        self.state.media.lock().unwrap().remove(session_id);
+    }
 }
 
 impl ProxyRegistrar for PlayerBridge {
@@ -311,6 +352,14 @@ impl ProxyRegistrar for PlayerBridge {
     fn unregister_manifest(&self, session_id: &str) {
         self.unregister_manifest_handler(session_id);
     }
+
+    fn register_media(&self, session_id: &str, streams: Vec<MediaUpstream>) -> String {
+        self.register_media_routes(session_id.to_string(), streams)
+    }
+
+    fn unregister_media(&self, session_id: &str) {
+        self.unregister_media_routes(session_id);
+    }
 }
 
 fn router(state: BridgeState) -> Router {
@@ -323,6 +372,10 @@ fn router(state: BridgeState) -> Router {
         .route(
             "/manifest/{session_id}/{route_path}",
             get(manifest_handler).head(manifest_handler),
+        )
+        .route(
+            "/media/{session_id}/{index}",
+            get(media_handler).head(media_handler),
         )
         .with_state(state)
 }
@@ -798,6 +851,57 @@ async fn manifest_handler(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Fetch one of a session's media URLs upstream and stream it back unchanged.
+///
+/// This exists so the player sees media as same-origin. A CDN that answers
+/// without `Access-Control-Allow-Origin` — YouTube's does not — would otherwise
+/// have the browser block the request before it left the page, whatever the
+/// upstream would have replied.
+async fn media_handler(
+    method: Method,
+    Path((session_id, index)): Path<(String, usize)>,
+    State(state): State<BridgeState>,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(upstream) = state.media_upstream(&session_id, index) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let mut request = state.http.request(method, &upstream.url);
+    for (name, value) in &upstream.headers {
+        request = request.header(name, value);
+    }
+    // Forward the player's own conditional/range headers so that seeking, and
+    // the byte-range probing Shaka does on load, reach upstream intact.
+    for name in [
+        http::header::RANGE,
+        http::header::IF_RANGE,
+        http::header::IF_MODIFIED_SINCE,
+        http::header::IF_NONE_MATCH,
+        http::header::ACCEPT,
+    ] {
+        if let Some(value) = request_headers.get(&name) {
+            request = request.header(name, value);
+        }
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, url = %upstream.url, "media proxy request failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let mut builder = Response::builder().status(response.status());
+    for (name, value) in &filter_upstream_response_headers(response.headers()) {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from_stream(response.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[cfg(test)]

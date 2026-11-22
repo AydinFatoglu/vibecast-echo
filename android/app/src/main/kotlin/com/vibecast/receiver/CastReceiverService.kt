@@ -1,11 +1,11 @@
 package com.vibecast.receiver
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
+import android.Manifest
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -15,8 +15,11 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import uniffi.vibecast_ffi.PlayerStartedInfo
 import uniffi.vibecast_ffi.ReceiverHandle
 import uniffi.vibecast_ffi.ReceiverObserver
@@ -57,9 +60,20 @@ class CastReceiverService :
     @Volatile
     private var wifiLock: WifiManager.WifiLock? = null
 
+    // Android drops multicast packets for apps that do not hold this lock, and
+    // the phone's DIAL search arrives as one — without it the receiver is
+    // invisible on the network however correct its SSDP replies are.
+    @Volatile
+    private var multicastLock: WifiManager.MulticastLock? = null
+
     // Per-player NSD registrations, keyed by player id. Touched only on the main
     // looper (registerPlayer / unregisterPlayer are always posted there).
     private val registrations = HashMap<String, PlayerRegistration>()
+
+    // Live players, keyed by player id. Separate from `registrations` because a
+    // cert-free receiver has players but advertises nothing — deriving the UI
+    // from the NSD map would then always report zero. Main looper only.
+    private val players = LinkedHashMap<String, String>()
 
     private data class PlayerAdvertisement(
         val name: String,
@@ -89,6 +103,10 @@ class CastReceiverService :
             stopSelf()
             return START_NOT_STICKY
         }
+        if (!hasLocalNetworkPermission(this)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         startForegroundNotification()
         acquireWifiLock()
         worker.execute { startReceiver() }
@@ -97,14 +115,14 @@ class CastReceiverService :
 
     private fun startReceiver() {
         if (handle != null) return
+        val settings = Settings(this)
         val certs = Provisioning.certsPath(this)
         if (certs == null) {
-            ReceiverState.update("Error", "certs.json not provisioned in ${filesDir.absolutePath}")
-            Log.e(TAG, "certs.json missing; provision via adb (see Provisioning.kt)")
-            stopSelf()
-            return
+            // Not an error: without device-auth material the receiver runs
+            // cert-free — no CastV2 listener and nothing advertised, rendering
+            // only what it launches itself (see autoLaunchAppId below).
+            Log.i(TAG, "no certs.json in ${filesDir.absolutePath}; starting cert-free")
         }
-        val settings = Settings(this)
         val config =
             ServerConfig(
                 dataDir = filesDir.absolutePath,
@@ -116,6 +134,9 @@ class CastReceiverService :
                 // the Rust routing heuristic can't be trusted on a multi-interface
                 // phone); null falls back to that heuristic.
                 localIp = localIpAddress(),
+                // Launch YouTube for local DIAL discovery without a Cast sender
+                // or a manually entered TV code.
+                autoLaunchAppId = YOUTUBE_APP_ID,
             )
         ReceiverState.update("Starting…")
         val newHandle = ReceiverHandle()
@@ -139,42 +160,55 @@ class CastReceiverService :
     // --- ReceiverObserver: invoked from Rust/Tokio worker threads ---
 
     override fun onPlayerStarted(started: PlayerStartedInfo) {
+        val discovery = started.discovery
         mainHandler.post {
-            registerPlayer(
-                started.playerId,
-                PlayerAdvertisement(
-                    started.name,
-                    started.instanceName,
-                    started.castPort.toInt(),
-                ),
-                started.txt,
-            )
+            players[started.playerId] = started.name
+            // Cert-free receivers bind no Cast port, so there is no service to
+            // advertise — the player still renders, just not for senders.
+            if (discovery != null) {
+                registerPlayer(
+                    started.playerId,
+                    PlayerAdvertisement(
+                        started.name,
+                        discovery.instanceName,
+                        discovery.castPort.toInt(),
+                    ),
+                    discovery.txt,
+                )
+            }
             refreshRunningState()
         }
         Log.i(
             TAG,
-            "player started: ${started.name} id=${started.playerId} cast=${started.castPort}",
+            "player started: ${started.name} id=${started.playerId} " +
+                "cast=${discovery?.castPort ?: "none (cert-free)"}",
         )
     }
 
     override fun onPlayerStopped(playerId: String) {
         mainHandler.post {
+            players.remove(playerId)
             unregisterPlayer(playerId)
             refreshRunningState()
         }
         Log.i(TAG, "player stopped: $playerId")
     }
 
+    // Manual TV-code pairing is disabled; phones discover this screen over DIAL.
+    override fun onPairingCode(
+        playerId: String,
+        code: String,
+    ) = Unit
+
     /** Reflect the running server + current player count in the UI. */
     private fun refreshRunningState() {
         val detail =
-            if (registrations.isEmpty()) {
+            if (players.isEmpty()) {
                 "Waiting for players…"
             } else {
-                val names = registrations.values.joinToString(", ") { it.advertisement.name }
-                "${registrations.size} player(s): $names"
+                "${players.size} player(s): ${players.values.joinToString(", ")}"
             }
-        ReceiverState.update("Running", detail)
+        ReceiverState.update(ReceiverState.RUNNING, detail)
     }
 
     override fun onError(message: String) {
@@ -271,19 +305,24 @@ class CastReceiverService :
                 setReferenceCounted(false)
                 acquire()
             }
+        multicastLock =
+            wifi.createMulticastLock("vibecast:discovery").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
     }
 
     // --- Notification ---
 
+    // Notification channels are API 26+; the Compat wrapper is a no-op on the
+    // API 25 floor, so no hand-written version guard is needed here.
     private fun createNotificationChannel() {
         val channel =
-            NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.channel_name),
-                NotificationManager.IMPORTANCE_LOW,
-            )
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-            .createNotificationChannel(channel)
+            NotificationChannelCompat
+                .Builder(CHANNEL_ID, NotificationManagerCompat.IMPORTANCE_LOW)
+                .setName(getString(R.string.channel_name))
+                .build()
+        NotificationManagerCompat.from(this).createNotificationChannel(channel)
     }
 
     private fun startForegroundNotification() {
@@ -326,11 +365,14 @@ class CastReceiverService :
         // Cancel any queued (re-)registration before tearing down NSD.
         mainHandler.removeCallbacksAndMessages(null)
         registrations.keys.toList().forEach { unregisterPlayer(it) }
+        players.clear()
         ReceiverState.update("Stopped")
         val stopping = handle
         handle = null
         val lock = wifiLock
         wifiLock = null
+        val multicast = multicastLock
+        multicastLock = null
         worker.execute {
             try {
                 stopping?.stop()
@@ -342,6 +384,7 @@ class CastReceiverService :
             // stays up for the receiver's cooperative teardown (clean TCP close,
             // app on_stop / DRM-release traffic).
             lock?.let { if (it.isHeld) it.release() }
+            multicast?.let { if (it.isHeld) it.release() }
         }
         worker.shutdown()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -353,11 +396,27 @@ class CastReceiverService :
         private const val CHANNEL_ID = "vibecast_receiver"
         private const val NOTIFICATION_ID = 1
         private const val SERVICE_TYPE = "_googlecast._tcp"
+
+        /** YouTube's Cast application id, launched without a Cast sender. */
+        private const val YOUTUBE_APP_ID = "233637DE"
         const val ACTION_STOP = "com.vibecast.receiver.STOP"
 
         fun start(context: Context) {
-            context.startForegroundService(Intent(context, CastReceiverService::class.java))
+            if (!hasLocalNetworkPermission(context)) return
+            // startForegroundService is API 26+. ContextCompat falls back to
+            // startService below that, which is correct on API 25: there are no
+            // background-start restrictions pre-Oreo, and onStartCommand still
+            // promotes the service via ServiceCompat.startForeground.
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, CastReceiverService::class.java),
+            )
         }
+
+        fun hasLocalNetworkPermission(context: Context): Boolean =
+            Build.VERSION.SDK_INT < 37 ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_LOCAL_NETWORK) ==
+                PackageManager.PERMISSION_GRANTED
 
         fun stop(context: Context) {
             context.startService(

@@ -77,10 +77,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let inputs = PlatformInputs {
         data_dir,
-        certs_path,
+        // Desktop is always Cast-facing: it serves real senders, so it always
+        // has a manifest to load.
+        certs_path: Some(certs_path),
         advertise_mdns: true,
         // Desktop derives the reported LAN IP from the routed interface.
         local_ip: None,
+        // Desktop launches apps through real Cast senders, not the cert-free path.
+        auto_launch_app_id: None,
     };
 
     let receiver = vibecast_platform::run(config, inputs, None)

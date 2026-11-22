@@ -182,7 +182,7 @@ mDNS), so senders find them regardless of port.
 ```sh
 # Android (Android TV) frontend — needs cargo-ndk + NDK r28+ + JDK 17.
 # Cross-compiles vibecast-ffi per ABI, generates UniFFI Kotlin bindings, builds the APK.
-cargo ndk -t arm64-v8a -t x86_64 -P 24 build --release -p vibecast-ffi   # .so per ABI
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -P 24 build --release -p vibecast-ffi  # .so per ABI
 cd android && ./gradlew :app:assembleDebug lintDebug ktlintCheck detekt   # app + lint gate
 ```
 

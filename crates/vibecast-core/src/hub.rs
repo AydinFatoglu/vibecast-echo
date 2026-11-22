@@ -30,14 +30,16 @@ use vibecast_player_api::{Player, PlayerCommand, PlayerReport};
 use vibecast_proto::CastMessage;
 use vibecast_sdk::{
     AppContext, AppSession, LaunchCredentials, MediaResolveError, MessageDisposition,
-    NoopSenderChannel, PlaybackController, PlaybackMedia, PlaybackState, PlayerCapabilities,
-    ReceiverContext, SenderChannel,
+    NoopSenderChannel, PairingObserver, PlaybackController, PlaybackMedia, PlaybackState,
+    PlayerCapabilities, ReceiverContext, SenderChannel,
 };
 use vibecast_settings::PlayerSettings;
 
 use crate::coordinator::{loading_media_info, media_info, Coordinator};
 use crate::identity::DeviceIdentity;
-use crate::proxy::{collect_routes, rewrite_streams, to_payload, SessionProxy};
+use crate::proxy::{
+    collect_media, collect_routes, rewrite_media, rewrite_streams, to_payload, SessionProxy,
+};
 use crate::registry::AppRegistry;
 use vibecast_player_api::ProxyRegistrar;
 
@@ -134,6 +136,9 @@ enum HubEvent {
     MediaResolved(MediaResolved),
     /// Playback initiated by an app-specific control channel.
     AppPlayback(AppPlaybackEvent),
+    /// Launch an app by Cast app id without a Cast sender (cert-free path, e.g.
+    /// YouTube driven by manual "Link with TV code" pairing).
+    LaunchApp { app_id: String },
     /// Stop all app sessions cleanly, then acknowledge (graceful shutdown).
     Shutdown(tokio::sync::oneshot::Sender<()>),
 }
@@ -193,6 +198,22 @@ impl DeviceHubHandle {
     pub async fn send_player_report(&self, report: PlayerReport) -> Result<(), HubClosed> {
         self.tx
             .send(HubEvent::Report(report))
+            .await
+            .map_err(|_| HubClosed)
+    }
+
+    /// Launch an app by its Cast app id without a Cast sender — the cert-free
+    /// path (e.g. YouTube driven by manual "Link with TV code" pairing). The
+    /// app session is wired to the hub's normal player path, so it renders
+    /// exactly as a Cast-launched session would.
+    ///
+    /// # Errors
+    /// Returns [`HubClosed`] if the hub has stopped.
+    pub async fn launch_app(&self, app_id: impl Into<String>) -> Result<(), HubClosed> {
+        self.tx
+            .send(HubEvent::LaunchApp {
+                app_id: app_id.into(),
+            })
             .await
             .map_err(|_| HubClosed)
     }
@@ -293,6 +314,11 @@ pub struct HubConfig {
     pub capabilities: PlayerCapabilities,
     /// Live settings scoped to the player bound to this receiver.
     pub player_settings: PlayerSettings,
+    /// Observer handed to apps launched without a Cast sender, so they can
+    /// surface the manual pairing code their own control channel produces
+    /// (cert-free path). `None` — the Cast default — leaves apps silent: with a
+    /// real sender there is no code to show.
+    pub pairing: Option<Arc<dyn PairingObserver>>,
 }
 
 /// The device hub actor.
@@ -308,6 +334,7 @@ pub struct DeviceHub {
     cast_device_capabilities: String,
     capabilities: PlayerCapabilities,
     player_settings: PlayerSettings,
+    pairing: Option<Arc<dyn PairingObserver>>,
     connections: HashMap<u64, ConnectionHandle>,
     /// `(connection, sender)` -> transport id.
     subscriptions: HashMap<(u64, String), String>,
@@ -335,6 +362,7 @@ impl DeviceHub {
             cast_device_capabilities: config.cast_device_capabilities,
             capabilities: config.capabilities,
             player_settings: config.player_settings,
+            pairing: config.pairing,
             connections: HashMap::new(),
             subscriptions: HashMap::new(),
             sessions: HashMap::new(),
@@ -381,6 +409,7 @@ impl DeviceHub {
             HubEvent::Report(report) => self.on_report(report).await,
             HubEvent::MediaResolved(resolved) => self.on_media_resolved(resolved).await,
             HubEvent::AppPlayback(event) => self.on_app_playback(event).await,
+            HubEvent::LaunchApp { app_id } => self.launch_app_certfree(app_id).await,
             HubEvent::Shutdown(ack) => {
                 for session_id in self.sessions.keys().cloned().collect::<Vec<_>>() {
                     self.stop_session(&session_id).await;
@@ -634,6 +663,122 @@ impl DeviceHub {
 
         let response = self.receiver_status(request.request_id);
         self.broadcast(RECEIVER_0, ns::RECEIVER, &response).await;
+    }
+
+    /// Launch an app without a Cast sender. Mirrors the session wiring of
+    /// [`handle_launch`] — same `NoopSenderChannel` and `HubPlaybackController`,
+    /// so the app renders through the normal player path — but drives no Cast
+    /// connection and emits no Cast responses. The app (e.g. YouTube) pairs its
+    /// own control channel (manual "Link with TV code") on launch.
+    async fn launch_app_certfree(&mut self, app_id: String) {
+        tracing::info!(%app_id, "cert-free LAUNCH");
+        let Some(registered) = self.registry.get(&app_id) else {
+            tracing::warn!(%app_id, "cert-free launch: app not registered");
+            return;
+        };
+        let manifest = &registered.manifest;
+        let settings = match self.player_settings.reader(manifest.app_key).await {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(%error, %app_id, app_key = %manifest.app_key, "cert-free launch: settings unavailable");
+                return;
+            }
+        };
+
+        // Re-launch joins the running session rather than restarting it.
+        if self
+            .sessions
+            .values()
+            .any(|session| session.app_id == app_id)
+        {
+            tracing::info!(%app_id, "cert-free launch: app already running; joining");
+            return;
+        }
+        // A launch replaces the current app: stop existing sessions first.
+        for session_id in self.sessions.keys().cloned().collect::<Vec<_>>() {
+            self.stop_session(&session_id).await;
+        }
+
+        let session_id = Uuid::new_v4().to_string();
+        let app_key = manifest.app_key;
+        let data_dir = self.data_dir.join("apps").join(app_key);
+        let _ = std::fs::create_dir_all(&data_dir);
+
+        let mut ctx = AppContext::new(
+            session_id.clone(),
+            session_id.clone(),
+            app_id.clone(),
+            self.http.clone(),
+            ReceiverContext {
+                friendly_name: self.identity.friendly_name.clone(),
+                device_model: self.identity.device_model.clone(),
+                device_id: self.identity.device_id.clone(),
+                data_dir,
+                user_agent: self.user_agent.clone(),
+                cast_device_capabilities: self.cast_device_capabilities.clone(),
+                capabilities: self.capabilities.clone(),
+            },
+            Arc::new(NoopSenderChannel),
+        )
+        .with_settings(settings)
+        .with_playback_controller(Arc::new(HubPlaybackController {
+            tx: self.self_tx.clone(),
+            session_id: session_id.clone(),
+        }));
+
+        // Only this launch path gets the observer: a cert-free launch has no
+        // sender to drive it, so the app must publish the pairing code it
+        // generates. `handle_launch` deliberately leaves it unset.
+        if let Some(pairing) = &self.pairing {
+            ctx = ctx.with_pairing_observer(pairing.clone());
+        }
+
+        let app: Arc<dyn AppSession> = match registered
+            .provider
+            .launch(
+                &ctx,
+                LaunchCredentials {
+                    credentials: None,
+                    credentials_type: None,
+                },
+            )
+            .await
+        {
+            Ok(session) => {
+                tracing::info!(%app_id, app_key = %app_key, session_id = %session_id, "cert-free app launched");
+                session
+            }
+            Err(error) => {
+                tracing::warn!(%error, %app_id, "cert-free app launch failed");
+                return;
+            }
+        };
+
+        let mut namespaces: Vec<String> = manifest
+            .namespaces
+            .iter()
+            .filter(|name| **name != ns::MEDIA)
+            .map(|name| (*name).to_string())
+            .collect();
+        namespaces.sort();
+        namespaces.push(ns::MEDIA.to_string());
+
+        let (jobs_tx, jobs_rx) = mpsc::channel(32);
+        tokio::spawn(run_app_session(app.clone(), jobs_rx));
+
+        let session = Session {
+            app_id: app_id.clone(),
+            app_key: app_key.to_string(),
+            display_name: manifest.display_name.to_string(),
+            icon_url: manifest.icon_url.map(str::to_string),
+            status_text: manifest.display_name.to_string(),
+            namespaces,
+            app,
+            ctx,
+            coordinator: Coordinator::new(self.volume.clone()),
+            jobs: jobs_tx,
+        };
+        self.sessions.insert(session_id, session);
     }
 
     async fn stop_session(&mut self, session_id: &str) {
@@ -1101,8 +1246,27 @@ impl DeviceHub {
         mut media: PlaybackMedia,
     ) -> PlaybackMedia {
         let (manifest_routes, license_routes) = collect_routes(&media);
+        let media_routes = collect_media(&media);
         let has_manifest = !manifest_routes.is_empty();
         let has_license = !license_routes.is_empty();
+        if !has_manifest && !has_license && media_routes.is_empty() {
+            return media;
+        }
+
+        // Media the player fetches itself goes through the bridge so it arrives
+        // same-origin; this needs no app involvement, so it is wired up before
+        // (and independently of) the app-backed manifest/license routes.
+        if !media_routes.is_empty() {
+            let base = self.proxy.register_media(
+                session_id,
+                media_routes
+                    .iter()
+                    .map(|(_, upstream)| upstream.clone())
+                    .collect(),
+            );
+            rewrite_media(&mut media, &base, &media_routes, media_session_id);
+        }
+
         if !has_manifest && !has_license {
             return media;
         }
@@ -1283,7 +1447,7 @@ impl DeviceHub {
             bound,
             subscribers,
         });
-        AppContext::new(
+        let ctx = AppContext::new(
             session.ctx.session_id.clone(),
             transport_id,
             session.ctx.app_id.clone(),
@@ -1292,7 +1456,13 @@ impl DeviceHub {
             sender,
         )
         .with_settings(session.ctx.settings.clone())
-        .with_playback_controller(session.ctx.playback_controller())
+        .with_playback_controller(session.ctx.playback_controller());
+        // Carry the session's pairing observer (if any) so a re-pair reported
+        // from a callback reaches the UI like the launch-time code did.
+        match session.ctx.pairing_observer() {
+            Some(pairing) => ctx.with_pairing_observer(pairing),
+            None => ctx,
+        }
     }
 
     async fn notify_app(&self, session_id: &str) {
@@ -1319,6 +1489,7 @@ impl DeviceHub {
     fn unregister_proxies(&self, session_id: &str) {
         self.proxy.unregister_manifest(session_id);
         self.proxy.unregister_license(session_id);
+        self.proxy.unregister_media(session_id);
     }
 
     async fn send_to<T: Serialize>(

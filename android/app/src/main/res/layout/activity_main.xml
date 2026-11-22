@@ -1,47 +1,101 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+  Two full-screen layers, and controls that appear only on a touch. The player
+  fills the window; the idle image covers it whenever there is no picture to
+  show, so the screen is either playing or presenting.
+
+  The player's built-in controls are off: its next/previous buttons act on
+  ExoPlayer's own playlist, which is always one item long here — the queue
+  lives in the receiver — so they would sit on screen doing nothing.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:gravity="center"
-    android:padding="48dp">
+    android:keepScreenOn="true"
+    android:clickable="true"
+    android:focusable="true"
+    tools:ignore="MergeRootFrame">
 
-    <TextView
-        android:id="@+id/title"
+    <!-- Keep the root: it is the accessible full-screen target that reveals controls. -->
+
+    <!-- texture_view, not the default SurfaceView: this panel's hardware
+         composer fails to create its sync fences ("can't create
+         mdp_sync_timeline"), so the overlay plane keeps showing the previous
+         video. Rendering through the GPU avoids that plane entirely. -->
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/player"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:surface_type="texture_view"
+        app:use_controller="false" />
+
+    <ImageView
+        android:id="@+id/idle"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:src="@drawable/idle_screen"
+        android:contentDescription="@string/idle_description" />
+
+    <!-- Hidden until the screen is touched. -->
+    <LinearLayout
+        android:id="@+id/controls"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/title"
-        android:textColor="@android:color/white"
-        android:textSize="28sp"
-        android:paddingBottom="24dp" />
+        android:layout_gravity="center"
+        android:orientation="horizontal"
+        android:visibility="gone">
 
-    <TextView
-        android:id="@+id/status"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:textColor="@android:color/white"
-        android:textSize="20sp" />
+        <ImageButton
+            android:id="@+id/play_pause_button"
+            android:layout_width="64dp"
+            android:layout_height="64dp"
+            android:background="@drawable/playback_button_background"
+            android:contentDescription="@string/pause_button"
+            android:padding="16dp"
+            app:srcCompat="@drawable/ic_pause" />
 
-    <TextView
-        android:id="@+id/detail"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:textColor="@android:color/darker_gray"
-        android:textSize="16sp"
-        android:paddingBottom="24dp" />
+        <ImageButton
+            android:id="@+id/next_button"
+            android:layout_width="64dp"
+            android:layout_height="64dp"
+            android:layout_marginStart="16dp"
+            android:background="@drawable/playback_button_background"
+            android:contentDescription="@string/next_button"
+            android:padding="16dp"
+            app:srcCompat="@drawable/ic_skip_next" />
+
+        <ImageButton
+            android:id="@+id/stop_button"
+            android:layout_width="64dp"
+            android:layout_height="64dp"
+            android:layout_marginStart="16dp"
+            android:background="@drawable/playback_button_background"
+            android:contentDescription="@string/stop_button"
+            android:padding="16dp"
+            app:srcCompat="@drawable/ic_stop" />
+
+    </LinearLayout>
 
     <Button
-        android:id="@+id/start_button"
+        android:id="@+id/close_button"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/start_button"
-        android:focusable="true" />
+        android:layout_gravity="top|end"
+        android:layout_margin="16dp"
+        android:text="@string/close_button"
+        android:visibility="gone" />
 
     <Button
-        android:id="@+id/stop_button"
+        android:id="@+id/privacy_button"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/stop_button"
-        android:focusable="true" />
+        android:layout_gravity="bottom|end"
+        android:layout_margin="16dp"
+        android:text="@string/privacy_button"
+        android:visibility="gone" />
 
-</LinearLayout>
+</FrameLayout>

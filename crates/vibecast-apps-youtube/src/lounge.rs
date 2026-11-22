@@ -19,8 +19,19 @@ const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 const DEFAULT_TOKEN_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
 /// Floor for the server's interval, and the retry delay after a failed refresh.
 const MIN_TOKEN_REFRESH: Duration = Duration::from_secs(60);
+/// The name the phone shows for this screen, in the cast list and in the
+/// account's linked devices. One constant, because a screen that answers to
+/// three different names reads as three different devices.
+pub(crate) const SCREEN_NAME: &str = "Show8Cast";
 /// Position change between player reports (~1 s apart) treated as a seek.
 const POSITION_JUMP_SECS: f64 = 3.0;
+/// How often the screen repeats its state even when nothing changed.
+///
+/// Transitions alone are not enough: a phone that hears nothing from the screen
+/// for about ten seconds sends `remoteDisconnected` and goes back to playing
+/// locally, which is exactly the "pick the receiver again for every video"
+/// symptom.
+const STATE_HEARTBEAT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LoungeCommand {
@@ -89,6 +100,8 @@ struct CurrentMedia {
     current_index: usize,
     next_pending: bool,
     state: Option<PlaybackState>,
+    /// When the screen last told the remote its state; see [`STATE_HEARTBEAT`].
+    state_posted_at: Option<tokio::time::Instant>,
 }
 
 impl CurrentMedia {
@@ -213,6 +226,52 @@ impl LoungeConnection {
         }
     }
 
+    /// Requests the human-readable manual pairing code to display on screen —
+    /// the "Link with TV code" flow the user types at youtube.com/pair. This is
+    /// the cert-free alternative to the Cast MDX bootstrap: it reuses the
+    /// screen id and lounge token already obtained in `establish`, with no Cast
+    /// session or device-auth certificate.
+    ///
+    /// NOTE: the endpoint name and response shape follow the public Lounge
+    /// pairing API and must be confirmed against a live request — YouTube
+    /// changes these surfaces. The response is returned verbatim (trimmed) so a
+    /// live capture can show whether it is the bare code or a JSON wrapper.
+    pub(crate) async fn get_pairing_code(&self) -> Result<String, LoungeError> {
+        let body = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer
+                .append_pair("access_type", "permanent")
+                .append_pair("app", "vibecast")
+                .append_pair("lounge_token", &self.lounge_token)
+                .append_pair("screen_id", &self.screen_id)
+                .append_pair("screen_name", SCREEN_NAME);
+            serializer.finish()
+        };
+        let text = self
+            .http
+            .post(join(&self.base, "pairing/get_pairing_code")?)
+            .header("User-Agent", USER_AGENT)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok(text.trim().to_string())
+    }
+
+    /// Everything the DIAL server needs to attach a phone to this screen.
+    pub(crate) fn registrar(&self, screen_name: impl Into<String>) -> PairingRegistrar {
+        PairingRegistrar {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            screen_id: self.screen_id.clone(),
+            screen_name: screen_name.into(),
+            device_id: self.device_id.clone(),
+        }
+    }
+
     /// Serves the Lounge until cancelled, publishing the identity (and every
     /// refreshed lounge token) on `identity_tx`.
     pub(crate) async fn run(
@@ -294,9 +353,31 @@ impl LoungeConnection {
                 }
                 state = playback_rx.recv() => {
                     let Some(state) = state else { return Ok(()); };
+                    // A finished player keeps saying so every second, so only
+                    // the transition counts; advancing on every report would
+                    // walk the queue once per tick.
+                    let was_finished = self.current.state.as_ref().is_some_and(|previous| {
+                        previous.player_state == PlayerState::Idle
+                            && previous.idle_reason == Some(IdleReason::Finished)
+                    });
+                    let finished = !was_finished
+                        && state.player_state == PlayerState::Idle
+                        && state.idle_reason == Some(IdleReason::Finished);
+                    if finished {
+                        tracing::info!(
+                            idle_reason = ?state.idle_reason,
+                            index = self.current.current_index,
+                            queued = self.current.video_ids.len(),
+                            finished,
+                            "player went idle"
+                        );
+                    }
                     let outbound = self.handle_playback(state);
                     if !outbound.is_empty() {
                         self.post(&outbound).await?;
+                    }
+                    if finished {
+                        self.advance(command_tx).await?;
                     }
                 }
                 result = poll => {
@@ -420,6 +501,40 @@ impl LoungeConnection {
         }
     }
 
+    /// Play the next queued video, the way a TV receiver does when one ends.
+    ///
+    /// Without this the screen simply stops at the end of a video: the remote
+    /// does not push the next one, it expects the screen to walk its own queue
+    /// and to say where it got to.
+    async fn advance(
+        &mut self,
+        command_tx: &mpsc::Sender<LoungeCommand>,
+    ) -> Result<(), LoungeError> {
+        // Nothing queued after this one: ask the remote to extend the queue,
+        // which it answers with `updatePlaylist`.
+        if self.current.current_index + 1 >= self.current.video_ids.len() {
+            tracing::info!(
+                index = self.current.current_index,
+                queued = self.current.video_ids.len(),
+                "end of the queue; asking the remote for the next video"
+            );
+            self.current.next_pending = true;
+            let _ = command_tx.send(LoungeCommand::Next).await;
+            return Ok(());
+        }
+        self.current.select(self.current.current_index + 1);
+        if command_tx.send(LoungeCommand::Next).await.is_err() {
+            return Ok(());
+        }
+        tracing::info!(
+            index = self.current.current_index,
+            video_id = self.current.video_id.as_deref().unwrap_or("?"),
+            "autoplaying the next queued video"
+        );
+        self.post(&[Outbound::HasPreviousNext, Outbound::NowPlaying])
+            .await
+    }
+
     fn handle_playback(&mut self, state: PlaybackState) -> Vec<Outbound> {
         // Stopped (or failed) playback is abandoned: like the TV receiver, clear
         // nowPlaying so the remote drops its Now playing view. FINISHED keeps it,
@@ -443,8 +558,13 @@ impl LoungeConnection {
             && previous
                 .as_ref()
                 .is_none_or(|previous| previous.duration.is_none());
+        let due = self
+            .current
+            .state_posted_at
+            .is_none_or(|posted| posted.elapsed() >= STATE_HEARTBEAT);
         let mut outbound = Vec::new();
-        if changed {
+        if changed || due {
+            self.current.state_posted_at = Some(tokio::time::Instant::now());
             outbound.push(Outbound::State(state));
         }
         if (abandoned && self.current.video_id.take().is_some()) || duration_learned {
@@ -454,6 +574,10 @@ impl LoungeConnection {
     }
 
     async fn post(&mut self, batch: &[Outbound]) -> Result<(), LoungeError> {
+        tracing::info!(
+            lounge_out = ?batch.iter().map(Outbound::name).collect::<Vec<_>>(),
+            "lounge batch to the remote"
+        );
         self.bound.rid += 1;
         let mut url = self.bind_url.clone();
         append_bound_query(&mut url, &self.bound, self.bound.rid.to_string().as_str());
@@ -519,7 +643,6 @@ fn form_body(
 }
 
 impl Outbound {
-    #[cfg(test)]
     fn name(&self) -> &'static str {
         match self {
             Self::AutoplayMode => "onAutoplayModeChanged",
@@ -545,10 +668,12 @@ impl Outbound {
     ) {
         let key = |name: &str| format!("{prefix}{name}");
         match self {
-            // vibecast plays only what the remote queues; it never autoplays.
+            // The screen walks its own queue now (see `advance`), so it must
+            // say so: a remote told autoplay is UNSUPPORTED neither offers an
+            // up-next video nor extends the queue when the screen asks.
             Self::AutoplayMode => {
                 form.append_pair(&key("_sc"), "onAutoplayModeChanged")
-                    .append_pair(&key("autoplayMode"), "UNSUPPORTED");
+                    .append_pair(&key("autoplayMode"), "ENABLED");
             }
             Self::NowPlaying => {
                 form.append_pair(&key("_sc"), "nowPlaying");
@@ -653,6 +778,45 @@ fn append_state_fields(
             &format!("{prefix}seekableEndTime"),
             &state.duration.unwrap_or_default().to_string(),
         );
+}
+
+/// Attaches phone-supplied DIAL pairing codes to one Lounge screen.
+///
+/// A phone that found the screen over DIAL hands it a code of its own instead
+/// of displaying one; registering that code is what puts the two on the same
+/// Lounge, with no Cast certificate anywhere in the exchange.
+#[derive(Clone)]
+pub(crate) struct PairingRegistrar {
+    http: reqwest::Client,
+    base: Url,
+    screen_id: String,
+    screen_name: String,
+    device_id: String,
+}
+
+impl PairingRegistrar {
+    pub(crate) async fn register(&self, code: &str) -> Result<(), LoungeError> {
+        let body = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer
+                .append_pair("access_type", "permanent")
+                .append_pair("app", "vibecast")
+                .append_pair("pairing_code", code)
+                .append_pair("screen_id", &self.screen_id)
+                .append_pair("screen_name", &self.screen_name)
+                .append_pair("device_id", &self.device_id);
+            serializer.finish()
+        };
+        self.http
+            .post(join(&self.base, "pairing/register_pairing_code")?)
+            .header("User-Agent", USER_AGENT)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
 
 async fn initial_bind(
@@ -791,6 +955,14 @@ fn parse_message(message: &[Value]) -> Incoming {
     let Some(name) = message.first().and_then(Value::as_str) else {
         return Incoming::Ignored;
     };
+    // Every name, handled or not: a remote that walks away does so through a
+    // message this parser currently drops, and the log is the only place that
+    // difference becomes visible.
+    tracing::info!(
+        lounge_in = %name,
+        params = %message.get(1).map(ToString::to_string).unwrap_or_default(),
+        "lounge message from the remote"
+    );
     let params = message.get(1);
     let command = match name {
         "setPlaylist" => parse_set_playlist(params),
@@ -1065,14 +1237,18 @@ fn build_bind_url(
         "os": "Android",
         "osVersion": "11.0",
         "chipset": "",
-        "clientName": "TVHTML5_CAST",
+        // A manually paired, always-running TV receiver — not a Cast-hosted
+        // one. Claiming TVHTML5_CAST tells the phone a Cast session backs this
+        // screen; there is none, so leaving the watch page ended the session
+        // with DISCONNECTED_BY_USER_PLAY_ON_PHONE.
+        "clientName": "TVHTML5",
         "dialAdditionalDataSupportLevel": "unsupported",
-        "mdxDialServerType": "MDX_DIAL_SERVER_TYPE_UNKNOWN"
+        "mdxDialServerType": "MDX_DIAL_SERVER_TYPE_STEADY_STATE"
     });
     url.query_pairs_mut()
         .append_pair("device", "LOUNGE_SCREEN")
         .append_pair("id", device_id)
-        .append_pair("name", "YouTube on TV")
+        .append_pair("name", SCREEN_NAME)
         .append_pair("app", "lb-v4")
         .append_pair("theme", "cl")
         // Mirrors the Cast-hosted TV receiver (captured from a SHIELD).

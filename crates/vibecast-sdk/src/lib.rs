@@ -87,7 +87,8 @@ mod types;
 
 pub use capabilities::{DrmCapability, DrmSecurityLevel, Platform, PlayerCapabilities, Resolution};
 pub use context::{
-    AppContext, NoopSenderChannel, PlaybackController, ReceiverContext, SenderChannel,
+    AppContext, NoopSenderChannel, PairingObserver, PlaybackController, ReceiverContext,
+    SenderChannel,
 };
 pub use error::{LaunchError, MediaResolveCode, MediaResolveError};
 pub use license::{LicenseForwarder, LicenseRequest, LicenseResponse, LicenseRoute};

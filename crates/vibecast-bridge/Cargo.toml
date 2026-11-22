@@ -16,6 +16,9 @@ vibecast-settings = { path = "../vibecast-settings" }
 tokio = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 http = { workspace = true }
+# The media proxy streams upstream responses straight through to the player,
+# so it needs `stream` for `Response::bytes_stream`.
+reqwest = { workspace = true, features = ["stream"] }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

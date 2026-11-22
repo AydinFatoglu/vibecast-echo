@@ -210,6 +210,25 @@ pub trait ProxyRegistrar: Send + Sync {
     fn register_manifest(&self, session_id: &str, handler: Arc<dyn ManifestHandler>) -> String;
     /// Unregister a session manifest handler.
     fn unregister_manifest(&self, session_id: &str);
+    /// Register this session's proxied media URLs; returns the proxy URL
+    /// prefix, to which `/{index}` selects one entry of `streams`.
+    fn register_media(&self, session_id: &str, streams: Vec<MediaUpstream>) -> String;
+    /// Unregister this session's proxied media URLs.
+    fn unregister_media(&self, session_id: &str);
+}
+
+/// One upstream media URL the proxy fetches on the player's behalf.
+///
+/// A manifest is proxied through [`ManifestHandler`], which rewrites the URLs
+/// inside it. This is for the other case: a stream the player fetches directly,
+/// where a CDN that answers without CORS headers would have a browser-based
+/// player's request blocked before it ever left the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaUpstream {
+    /// Absolute upstream URL.
+    pub url: String,
+    /// Headers to send upstream (e.g. a `User-Agent` a CDN token is bound to).
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 #[cfg(test)]

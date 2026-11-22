@@ -14,3 +14,13 @@ app/src/main/jniLibs/
 
 # Personal local build notes.
 LOCAL_BUILD.md
+
+# Release/upload signing material stays local.
+*.jks
+*.keystore
+*.p12
+keystore.properties
+
+# Store submission materials remain private on this workstation.
+/play-store/
+/build-play-release.ps1

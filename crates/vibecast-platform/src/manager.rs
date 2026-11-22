@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -23,12 +24,14 @@ use vibecast_discovery::{DeviceCapabilities, EurekaIdentity};
 use vibecast_messages::Volume;
 use vibecast_player_api::{Player, PlayerCapabilitiesPayload, PlayerReport};
 use vibecast_receiver::{
-    spawn as spawn_receiver, ReceiverParams, RunningReceiver as ReceiverInstance,
+    spawn as spawn_receiver, CastSurface, ReceiverDiscovery, ReceiverParams,
+    RunningReceiver as ReceiverInstance,
 };
 use vibecast_sdk::{
-    DrmCapability, DrmSecurityLevel, DrmSystem, Platform, PlayerCapabilities, Resolution,
+    DrmCapability, DrmSecurityLevel, DrmSystem, PairingObserver, Platform, PlayerCapabilities,
+    Resolution,
 };
-use vibecast_security::{CertResolver, CertificateStore};
+use vibecast_security::{CertResolver, CertificateBundle, CertificateStore};
 use vibecast_settings::PlayerSettings;
 
 /// Facts about a player's receiver, reported to a frontend that owns discovery
@@ -38,14 +41,11 @@ pub struct PlayerStarted {
     pub player_id: String,
     /// The advertised friendly name (`<reported name> [vibecast]`).
     pub name: String,
-    /// mDNS service instance label.
-    pub instance_name: String,
-    /// CastV2 TLS port bound for this player's receiver.
-    pub cast_port: u16,
-    /// Eureka HTTP port bound for this player's receiver.
-    pub eureka_http_port: u16,
-    /// Cast TXT record key/value pairs.
-    pub txt: Vec<(String, String)>,
+    /// Ports and mDNS facts to register for this player, or `None` when the
+    /// receiver started cert-free: no Cast surface was bound, so there is no
+    /// Cast device to advertise. The callback still fires, because the player
+    /// itself is live and its lifecycle still pairs with `on_player_stopped`.
+    pub discovery: Option<ReceiverDiscovery>,
 }
 
 /// Per-player lifecycle callbacks for a frontend that owns discovery
@@ -55,6 +55,37 @@ pub trait PlayerObserver: Send + Sync {
     fn on_player_started(&self, _started: PlayerStarted) {}
     /// A player's receiver stopped and should be unregistered.
     fn on_player_stopped(&self, _player_id: &str) {}
+    /// An app on this player's receiver published a manual pairing code to put
+    /// on screen. Only the certificate-free path reaches this: on the Cast path
+    /// a sender drives the launch, so no code is ever produced.
+    fn on_pairing_code(&self, _player_id: &str, _code: &str) {}
+}
+
+/// Forwards an app's manual pairing code to the frontend observer, tagged with
+/// the player whose receiver produced it.
+struct PairingBridge {
+    observer: Arc<dyn PlayerObserver>,
+    player_id: String,
+}
+
+#[async_trait]
+impl PairingObserver for PairingBridge {
+    async fn pairing_code(&self, code: &str) {
+        self.observer.on_pairing_code(&self.player_id, code);
+    }
+}
+
+/// The certificate material every per-player Cast surface is built from, plus
+/// the store the rotation loop polls.
+///
+/// `None` in [`ManagerConfig::certs`] is the cert-free path: no certificate is
+/// loaded, no receiver gets a Cast surface, and rotation has nothing to do.
+pub(crate) struct CertMaterial {
+    pub resolver: Arc<CertResolver>,
+    pub store: CertificateStore,
+    /// The active bundle; replaced in place when the store rotates.
+    pub bundle: CertificateBundle,
+    pub crl: Option<Vec<u8>>,
 }
 
 /// Eureka identity fields shared across every per-player receiver.
@@ -78,13 +109,16 @@ pub(crate) struct ManagerConfig {
     pub volume: Volume,
     pub user_agent: String,
     pub cast_device_capabilities: String,
-    pub resolver: Arc<CertResolver>,
-    pub store: CertificateStore,
-    pub crl: Option<Vec<u8>>,
+    /// Certificate material backing every per-player Cast surface. `None`
+    /// starts each receiver cert-free (hub + apps only).
+    pub certs: Option<CertMaterial>,
     pub bind_host: String,
     pub local_ip: String,
     pub eureka: EurekaConfig,
     pub advertise_mdns: bool,
+    /// Cast app id each per-player receiver auto-launches without a Cast sender
+    /// (cert-free). `None` disables it (desktop); Android sets YouTube's id.
+    pub auto_launch_app_id: Option<String>,
     pub cert_rotation_poll: f64,
     pub observer: Option<Arc<dyn PlayerObserver>>,
 }
@@ -100,15 +134,13 @@ struct TrackedReceiver {
 
 pub(crate) struct PlayerManager {
     config: ManagerConfig,
-    bundle: vibecast_security::CertificateBundle,
     receivers: HashMap<String, TrackedReceiver>,
 }
 
 impl PlayerManager {
-    pub(crate) fn new(config: ManagerConfig, bundle: vibecast_security::CertificateBundle) -> Self {
+    pub(crate) fn new(config: ManagerConfig) -> Self {
         Self {
             config,
-            bundle,
             receivers: HashMap::new(),
         }
     }
@@ -171,7 +203,34 @@ impl PlayerManager {
 
         let device_id = player_device_id(&self.config.installation_id, &player_id);
         let friendly_name = format!("{} [vibecast]", registration.name);
-        let eureka_identity = self.eureka_identity(&friendly_name, &device_id);
+
+        // The Cast surface exists only where certificate material does. Without
+        // it the receiver still runs — it just has nothing a sender can reach,
+        // which is exactly what the auto-launch path below drives instead.
+        let cast = self.config.certs.as_ref().map(|certs| CastSurface {
+            eureka_identity: self.eureka_identity(&friendly_name, &device_id),
+            resolver: certs.resolver.clone(),
+            bundle: certs.bundle.clone(),
+            crl: certs.crl.clone(),
+            bind_host: self.config.bind_host.clone(),
+            // Dynamic ports: each per-player receiver binds OS-assigned ports.
+            cast_port: 0,
+            eureka_http_port: 0,
+            eureka_https_port: 0,
+            advertise_mdns: self.config.advertise_mdns,
+        });
+
+        // A pairing code exists only where an app is launched without a sender,
+        // so the observer is wired up only alongside a cert-free auto-launch —
+        // leaving the Cast path (and every frontend that does not set one)
+        // exactly as before.
+        let pairing = match (&self.config.observer, &self.config.auto_launch_app_id) {
+            (Some(observer), Some(_)) => Some(Arc::new(PairingBridge {
+                observer: observer.clone(),
+                player_id: player_id.clone(),
+            }) as Arc<dyn PairingObserver>),
+            _ => None,
+        };
 
         let params = ReceiverParams {
             identity: DeviceIdentity::new(
@@ -179,7 +238,6 @@ impl PlayerManager {
                 self.config.model.clone(),
                 device_id,
             ),
-            eureka_identity,
             registry: self.config.registry.clone(),
             player,
             proxy: self.config.bridge.clone(),
@@ -191,15 +249,9 @@ impl PlayerManager {
             cast_device_capabilities: self.config.cast_device_capabilities.clone(),
             capabilities: player_capabilities(registration.capabilities),
             player_settings: settings,
-            resolver: self.config.resolver.clone(),
-            bundle: self.bundle.clone(),
-            crl: self.config.crl.clone(),
-            bind_host: self.config.bind_host.clone(),
-            // Dynamic ports: each per-player receiver binds OS-assigned ports.
-            cast_port: 0,
-            eureka_http_port: 0,
-            eureka_https_port: 0,
-            advertise_mdns: self.config.advertise_mdns,
+            cast,
+            auto_launch_app_id: self.config.auto_launch_app_id.clone(),
+            pairing,
         };
 
         let receiver = match spawn_receiver(params).await {
@@ -210,22 +262,26 @@ impl PlayerManager {
             }
         };
 
-        tracing::info!(
-            player_id = %player_id,
-            name = %friendly_name,
-            cast_port = receiver.cast_port,
-            instance = %receiver.instance_name,
-            "started receiver for player"
-        );
+        match receiver.discovery() {
+            Some(discovery) => tracing::info!(
+                player_id = %player_id,
+                name = %friendly_name,
+                cast_port = discovery.cast_port,
+                instance = %discovery.instance_name,
+                "started receiver for player"
+            ),
+            None => tracing::info!(
+                player_id = %player_id,
+                name = %friendly_name,
+                "started cert-free receiver for player"
+            ),
+        }
 
         if let Some(observer) = &self.config.observer {
             observer.on_player_started(PlayerStarted {
                 player_id: player_id.clone(),
                 name: friendly_name,
-                instance_name: receiver.instance_name.clone(),
-                cast_port: receiver.cast_port,
-                eureka_http_port: receiver.eureka_http_port,
-                txt: receiver.txt.clone(),
+                discovery: receiver.discovery().cloned(),
             });
         }
 
@@ -250,7 +306,11 @@ impl PlayerManager {
     }
 
     async fn rotate_certificates(&mut self) {
-        let rotated = match self.config.store.rotate_if_needed(unix_now()) {
+        // Cert-free: no store to poll, and no receiver holds material to swap.
+        let Some(certs) = &mut self.config.certs else {
+            return;
+        };
+        let rotated = match certs.store.rotate_if_needed(unix_now()) {
             Ok(Some(bundle)) => bundle.clone(),
             Ok(None) => return,
             Err(error) => {
@@ -258,21 +318,20 @@ impl PlayerManager {
                 return;
             }
         };
-        if let Err(error) = self.config.resolver.update(&rotated) {
+        if let Err(error) = certs.resolver.update(&rotated) {
             tracing::error!(%error, "failed to hot-swap TLS certificate");
             return;
         }
         // New receivers registered after this point use the rotated bundle.
-        self.bundle = rotated.clone();
-        let crl = rotated.crl.clone().or_else(|| self.config.crl.clone());
+        certs.bundle = rotated.clone();
+        let crl = rotated.crl.clone().or_else(|| certs.crl.clone());
         for tracked in self.receivers.values() {
-            tracked
-                .receiver
-                .rotation_handle()
-                .update_auth(AuthMaterial {
+            if let Some(handle) = tracked.receiver.rotation_handle() {
+                handle.update_auth(AuthMaterial {
                     bundle: rotated.clone(),
                     crl: crl.clone(),
                 });
+            }
         }
         tracing::info!("rotated active certificate (TLS + device-auth)");
     }

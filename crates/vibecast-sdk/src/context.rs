@@ -60,6 +60,19 @@ impl PlaybackController for NoopPlaybackController {
     async fn stop(&self) {}
 }
 
+/// Receives the human-readable code an app produces when it pairs its own
+/// control channel without a Cast sender (the certificate-free path, e.g.
+/// YouTube's manual "Link with TV code"). The platform supplies an
+/// implementation that forwards the code to the UI; a context with no observer
+/// leaves pairing unset and the app skips producing a manual code (so the
+/// normal Cast flow, which is driven by a real sender, is unaffected).
+#[async_trait]
+pub trait PairingObserver: Send + Sync {
+    /// Report the code to display. Called once each time a pairing is
+    /// established (apps may re-pair, e.g. after a token refresh).
+    async fn pairing_code(&self, code: &str);
+}
+
 /// Receiver metadata made available to app sessions.
 #[derive(Debug, Clone)]
 pub struct ReceiverContext {
@@ -117,6 +130,7 @@ pub struct AppContext {
     pub settings: AppSettingsReader,
     sender: Arc<dyn SenderChannel>,
     playback: Arc<dyn PlaybackController>,
+    pairing: Option<Arc<dyn PairingObserver>>,
 }
 
 impl AppContext {
@@ -140,6 +154,7 @@ impl AppContext {
             receiver,
             sender,
             playback: Arc::new(NoopPlaybackController),
+            pairing: None,
         }
     }
 
@@ -161,6 +176,21 @@ impl AppContext {
     #[must_use]
     pub fn playback_controller(&self) -> Arc<dyn PlaybackController> {
         self.playback.clone()
+    }
+
+    /// Bind a pairing-code observer for certificate-free control-channel
+    /// pairing. Without one, an app skips producing a manual pairing code.
+    #[must_use]
+    pub fn with_pairing_observer(mut self, pairing: Arc<dyn PairingObserver>) -> Self {
+        self.pairing = Some(pairing);
+        self
+    }
+
+    /// The pairing-code observer, if the platform supplied one. An app surfaces
+    /// a manual pairing code only when this returns `Some`.
+    #[must_use]
+    pub fn pairing_observer(&self) -> Option<Arc<dyn PairingObserver>> {
+        self.pairing.clone()
     }
 
     /// Send a custom-namespace message to the sender associated with this
@@ -283,5 +313,39 @@ mod tests {
         assert_eq!(ctx.settings.snapshot().revision(), 0);
         assert!(ctx.settings.snapshot().values().is_empty());
         assert_eq!(cloned.settings.snapshot(), ctx.settings.snapshot());
+    }
+
+    #[derive(Default)]
+    struct CapturingPairing {
+        codes: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl PairingObserver for CapturingPairing {
+        async fn pairing_code(&self, code: &str) {
+            self.codes
+                .lock()
+                .expect("codes not poisoned")
+                .push(code.to_string());
+        }
+    }
+
+    #[test]
+    fn pairing_observer_is_absent_by_default() {
+        let ctx = ctx(Arc::new(CapturingChannel::default()));
+        assert!(ctx.pairing_observer().is_none());
+    }
+
+    #[tokio::test]
+    async fn with_pairing_observer_roundtrips_and_receives_code() {
+        let observer = Arc::new(CapturingPairing::default());
+        let ctx =
+            ctx(Arc::new(CapturingChannel::default())).with_pairing_observer(observer.clone());
+
+        let bound = ctx.pairing_observer().expect("observer present");
+        bound.pairing_code("123456789012").await;
+
+        let codes = observer.codes.lock().expect("codes not poisoned");
+        assert_eq!(codes.as_slice(), ["123456789012"]);
     }
 }

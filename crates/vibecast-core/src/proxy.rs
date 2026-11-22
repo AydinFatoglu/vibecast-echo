@@ -22,7 +22,8 @@ use vibecast_player_api::{
     manifest_route_suffix, normalize_manifest_bytes, proxy_hls_children, DrmPayload,
     DrmSystem as WireDrmSystem, LicenseHandler, LicenseRequest as WireLicenseRequest,
     LicenseResponse as WireLicenseResponse, ManifestHandler, ManifestKind, ManifestProxyRequest,
-    ManifestProxyResponse, PlaybackMediaPayload, PlaybackStreamPayload, ProxyResult, RouteId,
+    ManifestProxyResponse, MediaUpstream, PlaybackMediaPayload, PlaybackStreamPayload, ProxyResult,
+    RouteId,
 };
 use vibecast_sdk::{
     AppContext, AppSession, DrmSystem, LicenseForwarder, LicenseRequest, LicenseResponse,
@@ -472,6 +473,51 @@ pub(crate) fn collect_routes(
 /// Kodi InputStream) serve the first stream's cached manifest for every
 /// subsequent stream switch. Bumping the version per load makes each load a
 /// distinct resource so the manifest is always re-fetched.
+/// The streams a player would have to fetch itself, paired with their index.
+///
+/// A manifest stream is handled by the manifest proxy, which rewrites the URLs
+/// inside it; everything else is a direct fetch, and a direct fetch of a
+/// cross-origin CDN is what a browser-based player cannot do.
+pub(crate) fn collect_media(media: &PlaybackMedia) -> Vec<(usize, MediaUpstream)> {
+    media
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(_, stream)| manifest_kind_for(stream).is_none())
+        .filter_map(|(index, stream)| {
+            stream.source.as_url().map(|url| {
+                (
+                    index,
+                    MediaUpstream {
+                        url: url.to_string(),
+                        headers: stream.request_headers.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// Point each directly-fetched stream at `base` instead of its CDN, so the
+/// player requests it same-origin and the proxy does the cross-origin fetch.
+pub(crate) fn rewrite_media(
+    media: &mut PlaybackMedia,
+    base: &str,
+    proxied: &[(usize, MediaUpstream)],
+    media_session_id: i64,
+) {
+    for (slot, (index, _)) in proxied.iter().enumerate() {
+        let Some(stream) = media.streams.get_mut(*index) else {
+            continue;
+        };
+        stream.source = StreamSource::Url(format!("{base}/{slot}?v={media_session_id}"));
+        // The proxy applies these upstream now, so the player must not also
+        // send them — and on a browser player a custom header would turn the
+        // request into a preflighted one for no gain.
+        stream.request_headers.clear();
+    }
+}
+
 pub(crate) fn rewrite_streams(
     media: &mut PlaybackMedia,
     manifest_base: Option<&str>,

@@ -2,9 +2,10 @@
 //!
 //! Every platform binding — the desktop [`vibecast-cli`] binary and the
 //! `vibecast-ffi` cdylib (Android/iOS) — assembles the same portable core the
-//! same way: load certificates, register apps, build the HTTP client, start
-//! the player bridge, the device hub, the CastV2 TLS server, and the eureka
-//! HTTP/HTTPS endpoints, then supervise them under one cancellation token.
+//! same way: load certificates (when a manifest is configured), register apps,
+//! build the HTTP client, start the player bridge, the device hub and — unless
+//! running cert-free — the CastV2 TLS server and the eureka HTTP/HTTPS
+//! endpoints, then supervise them under one cancellation token.
 //!
 //! That composition lives here so the two bindings never drift. What stays in
 //! each binding is only what is genuinely platform-specific: argument/settings
@@ -50,13 +51,14 @@ use vibecast_settings::{
     SettingsCatalog, SettingsPersistence, SettingsService, SettingsServiceError,
 };
 
-use manager::{EurekaConfig, ManagerConfig, PlayerManager};
+use manager::{CertMaterial, EurekaConfig, ManagerConfig, PlayerManager};
 
 pub use config::{
     CastConfig, CastDeviceCapabilities, Config, ConfigError, DeviceConfig, NetworkConfig,
     VolumeConfig,
 };
 pub use manager::{PlayerObserver, PlayerStarted};
+pub use vibecast_receiver::ReceiverDiscovery;
 
 const INSTALLATION_ID_FILE: &str = "installation_id";
 const SETTINGS_FILE: &str = "settings.json";
@@ -72,8 +74,10 @@ const CRL_URL: &str = "https://clients3.google.com/cast/chromecast/device/crl";
 pub struct PlatformInputs {
     /// Directory holding receiver state (hub scratch, app data).
     pub data_dir: PathBuf,
-    /// Absolute path to the certificate manifest.
-    pub certs_path: PathBuf,
+    /// Absolute path to the certificate manifest, or `None` to run **cert-free**:
+    /// nothing Cast-facing is bound and no certificate is read, so the receiver
+    /// is reachable only through [`auto_launch_app_id`](Self::auto_launch_app_id).
+    pub certs_path: Option<PathBuf>,
     /// Advertise each per-player receiver over mDNS from Rust. Desktop sets
     /// `true`; Android sets `false` and registers via `NsdManager` per player,
     /// consuming the facts delivered to [`PlayerObserver::on_player_started`].
@@ -85,6 +89,11 @@ pub struct PlatformInputs {
     /// site-local IPv4) should supply it explicitly rather than relying on the
     /// heuristic.
     pub local_ip: Option<String>,
+    /// Cast app id every per-player receiver auto-launches without a Cast sender
+    /// (cert-free path). Android sets this (e.g. YouTube `"233637DE"`) so the
+    /// Echo renders via a manual "Link with TV code" pairing with no Cast
+    /// device certificate; desktop leaves it `None` and launches via Cast.
+    pub auto_launch_app_id: Option<String>,
 }
 
 /// Errors assembling or starting the receiver.
@@ -216,6 +225,7 @@ pub async fn run(
         certs_path,
         advertise_mdns,
         local_ip,
+        auto_launch_app_id,
     } = inputs;
 
     let model = config.device.model.clone();
@@ -228,9 +238,30 @@ pub async fn run(
     let installation_id = load_or_create_installation_id(&data_dir)?;
 
     // --- certificates (shared across every per-player receiver) ---
-    let store = CertificateStore::from_manifest_path(&certs_path)?;
-    let bundle = store.active_bundle().clone();
-    let resolver = CertResolver::new(&bundle)?;
+    // Absent on the cert-free path: no manifest is read and no per-player Cast
+    // surface is bound, so there is nothing for a sender to connect to.
+    let mut certs = match &certs_path {
+        Some(path) => {
+            let store = CertificateStore::from_manifest_path(path)?;
+            let bundle = store.active_bundle().clone();
+            Some(CertMaterial {
+                resolver: CertResolver::new(&bundle)?,
+                store,
+                bundle,
+                // Filled in below, once the shared HTTP client exists.
+                crl: None,
+            })
+        }
+        None => {
+            if auto_launch_app_id.is_none() {
+                tracing::warn!(
+                    "no certificate manifest and no auto-launch app: this receiver \
+                     accepts no senders and starts nothing on its own"
+                );
+            }
+            None
+        }
+    };
 
     // --- apps ---
     let registry = AppRegistry::new(build_app_providers())?;
@@ -261,8 +292,11 @@ pub async fn run(
     // --- shared HTTP client (User-Agent + CAST-DEVICE-CAPABILITIES + timeout) ---
     let http = build_http_client(&config)?;
 
-    // Device-auth CRL: prefer the manifest's embedded CRL, else fetch from Google.
-    let crl = resolve_crl(&http, bundle.crl.clone()).await;
+    // Device-auth CRL: prefer the manifest's embedded CRL, else fetch from
+    // Google. Cert-free there is no device auth, so nothing to revoke against.
+    if let Some(certs) = &mut certs {
+        certs.crl = resolve_crl(&http, certs.bundle.crl.clone()).await;
+    }
 
     // --- shared player bridge (registration + proxy hosting) ---
     let (events_tx, events_rx) = mpsc::channel(64);
@@ -286,9 +320,7 @@ pub async fn run(
         volume: initial_volume(&config),
         user_agent: config.cast.user_agent.clone(),
         cast_device_capabilities: config.cast.device_capabilities.header_value(),
-        resolver,
-        store,
-        crl,
+        certs,
         bind_host,
         local_ip: local_ip.clone(),
         eureka: EurekaConfig {
@@ -300,11 +332,12 @@ pub async fn run(
             capabilities: config.device.capabilities.clone(),
         },
         advertise_mdns,
+        auto_launch_app_id,
         cert_rotation_poll: config.network.cert_rotation_poll,
         observer,
     };
     let shutdown = CancellationToken::new();
-    let manager = PlayerManager::new(manager_config, bundle);
+    let manager = PlayerManager::new(manager_config);
     let manager_task = tokio::spawn(manager.run(events_rx, shutdown.clone()));
 
     Ok(RunningReceiver {
