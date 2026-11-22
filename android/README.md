@@ -14,7 +14,7 @@ a TV code. External Kodi and browser players can also connect to the bridge.
 
 - Android 7.1.2 (API 25) or later; `arm64-v8a`, `armeabi-v7a` or `x86_64`
 - Device-auth certificates are optional for YouTube's DIAL flow; CastV2
-  authentication still needs them (see [Certificates](../README.md#certificates)).
+  authentication still needs them (see [Certificates](https://github.com/emilsvennesson/vibecast/blob/main/README.md#certificates)).
 
 ## Build
 
