@@ -46,11 +46,23 @@ installed on the Echo Show 8 (1st Gen).
 
 ## Install
 
-Build the ARMv7 APK using the command above, then install it with ADB:
+Download the production-signed
+[Show8Cast ARM32 release](https://github.com/AydinFatoglu/vibecast-echo/releases/latest/download/Show8Cast-v0.2.0-armv7-release.apk),
+then install it with ADB:
 
 ```sh
-adb install -r android/app/build/outputs/apk/debug/Show8Cast-debug.apk
+adb install Show8Cast-v0.2.0-armv7-release.apk
 ```
+
+If the earlier debug-signed build is already installed, uninstall it first
+because Android does not allow an app to change signing certificates in place:
+
+```sh
+adb uninstall com.vibecast.receiver
+adb install Show8Cast-v0.2.0-armv7-release.apk
+```
+
+Uninstalling clears the app's local data and settings.
 
 Open **Show8Cast** on the Echo Show. On your phone, open YouTube, choose the
 Cast button, select **Show8Cast**, and start playback.
